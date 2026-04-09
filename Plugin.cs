@@ -10,8 +10,6 @@ namespace InfectionGauge;
 
 [BepInPlugin("rer.wmo.mods.infectiongauge", "Infection Gauge", "1.0.0")]
 [BepInDependency("rer.wmo.mods.corelibrary", BepInDependency.DependencyFlags.HardDependency)]
-[BepInDependency("rer.wmo.mods.customitems", BepInDependency.DependencyFlags.HardDependency)]
-[BepInDependency("rer.wmo.mods.bossspawner", BepInDependency.DependencyFlags.HardDependency)]
 public class Plugin : BaseUnityPlugin
 {
     internal static new ManualLogSource Logger;
@@ -77,7 +75,7 @@ public class Plugin : BaseUnityPlugin
             Logger.LogInfo("[Antivirus] Registering antivirus item and recipe...");
             
             // Register the item
-            var antivirusItem = new CustomItems.CustomItemDefinition
+            var antivirusItem = new CoreLibrary.CustomItemDefinition
             {
                 ItemId = ANTIVIRUS_ITEM_ID,
                 ItemName = "Antivirus",
@@ -94,9 +92,9 @@ public class Plugin : BaseUnityPlugin
                 }
             };
             
-            CustomItems.CustomItemManager.RegisterItem(antivirusItem);
+            CoreLibrary.CustomItemHelper.RegisterItem(antivirusItem);
             
-            var antivirusRecipe = new CustomItems.CustomRecipeDefinition
+            var antivirusRecipe = new CoreLibrary.CustomRecipeDefinition
             {
                 RecipeId = ANTIVIRUS_RECIPE_ID,
                 ItemId = ANTIVIRUS_ITEM_ID,
@@ -104,9 +102,9 @@ public class Plugin : BaseUnityPlugin
                 RecipeItemType = 1, // Medicine
                 RecipeCategory = 0,
                 CraftAmount = 1,
-                Ingredients = new System.Collections.Generic.List<CustomItems.RecipeIngredient>
+                Ingredients = new System.Collections.Generic.List<CoreLibrary.RecipeIngredient>
                 {
-                    new CustomItems.RecipeIngredient
+                    new CoreLibrary.RecipeIngredient
                     {
                         MaterialId = CHEMICAL_MATERIAL_ID,
                         Amount = CHEMICAL_AMOUNT
@@ -114,7 +112,7 @@ public class Plugin : BaseUnityPlugin
                 }
             };
             
-            CustomItems.CustomItemManager.RegisterRecipe(antivirusRecipe);
+            CoreLibrary.CustomItemHelper.RegisterRecipe(antivirusRecipe);
             
             Logger.LogInfo($"[Antivirus] Item ID: {ANTIVIRUS_ITEM_ID}, Recipe: {ANTIVIRUS_RECIPE_ID}");
         }
@@ -451,7 +449,7 @@ public class Plugin : BaseUnityPlugin
             if (NetworkHelper.IsServer())
             {
                 Logger.LogInfo("[KillPlayer] Server is spawning elite enemy...");
-                bool spawnSuccess = BossSpawner.EliteSpawnManager.SpawnEliteAtPosition(deathPosition);
+                bool spawnSuccess = CoreLibrary.EliteSpawnHelper.SpawnEliteAtPosition(deathPosition);
                 
                 if (spawnSuccess)
                 {

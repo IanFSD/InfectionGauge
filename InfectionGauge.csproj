@@ -18,6 +18,14 @@
   </ItemGroup>
   
   <ItemGroup>
+    <Reference Include="Assembly-CSharp">
+      <HintPath>$(ProjectDir)..\libs\Assembly-CSharp.dll</HintPath>
+      <Private>False</Private>
+    </Reference>
+    <Reference Include="DoozyRuntime">
+      <HintPath>$(ProjectDir)..\libs\DoozyRuntime.dll</HintPath>
+      <Private>False</Private>
+    </Reference>
     <Reference Include="Unity.TextMeshPro">
       <HintPath>$(ProjectDir)..\libs\Unity.TextMeshPro.dll</HintPath>
       <Private>False</Private>
@@ -32,12 +40,6 @@
     <ProjectReference Include="..\CoreLibrary\CoreLibrary.csproj">
       <Private>False</Private>
     </ProjectReference>
-    <ProjectReference Include="..\CustomItems\CustomItems.csproj">
-      <Private>False</Private>
-    </ProjectReference>
-    <ProjectReference Include="..\BossSpawner\BossSpawner.csproj">
-      <Private>False</Private>
-    </ProjectReference>
   </ItemGroup>
 
   <PropertyGroup>
@@ -48,8 +50,6 @@
 
   <ItemGroup>
     <ModDependency Include="rer.wmo.mods.corelibrary" IsRequired="true" />
-    <ModDependency Include="rer.wmo.mods.customitems" IsRequired="true" />
-    <ModDependency Include="rer.wmo.mods.bossspawner" IsRequired="true" />
   </ItemGroup>
 
 </Project>
