@@ -50,7 +50,15 @@ public class Plugin : BaseUnityPlugin
     
     // UI elements
     private static TextMeshProUGUI _infectionTextUI = null;
+    private static Image _infectionCircleBg = null;
     private static GameObject _infectionUIContainer = null;
+    private static RectTransform[] _orbiterRects = null;
+    private static Image[] _orbiterImages = null;
+    private static Vector2[] _orbiterVelocities = null;
+    private const int ORBITER_COUNT = 5;
+    private const float CIRCLE_INNER_RADIUS = 25f; // Stay inside the 60px circle
+    private const float ORBITER_SIZE = 5f;
+    private static float _lastOrbiterTime = 0f;
 
     private void Awake()
     {
@@ -89,6 +97,8 @@ public class Plugin : BaseUnityPlugin
                 OnItemUsed = (invObj) =>
                 {
                     _customInfection = Mathf.Max(0f, _customInfection - INFECTION_HEAL_AMOUNT);
+                    _lastLoggedMilestone = Mathf.FloorToInt(_customInfection / 10f);
+                    UpdateInfectionText();
                 }
             };
             
@@ -208,7 +218,11 @@ public class Plugin : BaseUnityPlugin
                 
                 // Clear stale Unity object references from previous scene
                 _infectionTextUI = null;
+                _infectionCircleBg = null;
                 _infectionUIContainer = null;
+                _orbiterRects = null;
+                _orbiterImages = null;
+                _orbiterVelocities = null;
             }
 
             // Exit early if in lobby - don't increase infection
@@ -218,7 +232,18 @@ public class Plugin : BaseUnityPlugin
                 if (!_hasLoggedLobbyStatus)
                 {
                     _hasLoggedLobbyStatus = true;
+                    
+                    // Reset permadeath state so player is alive in lobby
+                    // (infection stays, giving them a chance to use antivirus)
+                    var pc = player as PlayerController;
+                    if (pc != null && pc.isPermadeath)
+                    {
+                        pc.isPermadeath = false;
+                        Logger.LogInfo("[Lobby] Reset permadeath state - player alive with infection");
+                    }
                 }
+                // Still update UI in lobby so the gauge animation runs
+                UpdateInfectionUIIfOpen();
                 return;
             }
 
@@ -312,6 +337,123 @@ public class Plugin : BaseUnityPlugin
     }
     
     /// <summary>
+    /// Updates the infection text and color on the UI element
+    /// </summary>
+    private static void UpdateInfectionText()
+    {
+        if (_infectionTextUI == null)
+            return;
+        
+        _infectionTextUI.text = $"{_customInfection:00.00}%";
+        
+        float t = _customInfection / INFECTION_KILL_THRESHOLD;
+        Color gaugeColor = GetInfectionColor(_customInfection);
+        
+        _infectionTextUI.color = gaugeColor;
+        
+        if (_infectionCircleBg != null)
+        {
+            _infectionCircleBg.color = new Color(
+                gaugeColor.r * 0.25f,
+                gaugeColor.g * 0.25f,
+                gaugeColor.b * 0.25f,
+                0.75f
+            );
+        }
+        
+        UpdateOrbiters(t, gaugeColor);
+    }
+    
+    private static Color GetInfectionColor(float infection)
+    {
+        if (infection < 40f)
+            return new Color(0.2f, 0.85f, 0.2f, 1f);       // Green
+        if (infection < 50f)
+            return new Color(0.1f, 0.55f, 0.1f, 1f);       // Darker green
+        if (infection < 70f)
+            return new Color(0.95f, 0.85f, 0.1f, 1f);      // Yellow
+        if (infection < 90f)
+            return new Color(0.9f, 0.15f, 0.1f, 1f);       // Red
+        return new Color(0.5f, 0.05f, 0.05f, 1f);           // Dark red
+    }
+    
+    private static void UpdateOrbiters(float t, Color gaugeColor)
+    {
+        if (_orbiterRects == null || _orbiterImages == null || _orbiterVelocities == null)
+            return;
+        
+        float currentTime = Time.time;
+        float dt = Mathf.Min(currentTime - _lastOrbiterTime, 0.05f);
+        _lastOrbiterTime = currentTime;
+        
+        if (dt <= 0f) return;
+        
+        float speed = 15f + t * 40f;
+        float orbiterRadius = ORBITER_SIZE * 0.5f;
+        
+        // Move each orbiter
+        for (int i = 0; i < ORBITER_COUNT; i++)
+        {
+            if (_orbiterRects[i] == null) continue;
+            
+            Vector2 pos = _orbiterRects[i].anchoredPosition;
+            pos += _orbiterVelocities[i] * speed * dt;
+            
+            // Bounce off circle boundary
+            float dist = pos.magnitude;
+            float maxDist = CIRCLE_INNER_RADIUS - orbiterRadius;
+            if (dist > maxDist && dist > 0f)
+            {
+                // Reflect velocity off the circle wall
+                Vector2 normal = pos.normalized;
+                _orbiterVelocities[i] = _orbiterVelocities[i] - 2f * Vector2.Dot(_orbiterVelocities[i], normal) * normal;
+                pos = normal * maxDist;
+            }
+            
+            _orbiterRects[i].anchoredPosition = pos;
+        }
+        
+        // Check collisions between orbiters
+        for (int i = 0; i < ORBITER_COUNT; i++)
+        {
+            if (_orbiterRects[i] == null) continue;
+            for (int j = i + 1; j < ORBITER_COUNT; j++)
+            {
+                if (_orbiterRects[j] == null) continue;
+                
+                Vector2 posA = _orbiterRects[i].anchoredPosition;
+                Vector2 posB = _orbiterRects[j].anchoredPosition;
+                Vector2 diff = posA - posB;
+                float distSq = diff.sqrMagnitude;
+                float minDist = ORBITER_SIZE;
+                
+                if (distSq < minDist * minDist && distSq > 0.001f)
+                {
+                    Vector2 normal = diff.normalized;
+                    // Push apart
+                    float overlap = minDist - Mathf.Sqrt(distSq);
+                    _orbiterRects[i].anchoredPosition = posA + normal * (overlap * 0.5f);
+                    _orbiterRects[j].anchoredPosition = posB - normal * (overlap * 0.5f);
+                    
+                    // Swap velocity components along collision normal
+                    float dotI = Vector2.Dot(_orbiterVelocities[i], normal);
+                    float dotJ = Vector2.Dot(_orbiterVelocities[j], normal);
+                    _orbiterVelocities[i] += (dotJ - dotI) * normal;
+                    _orbiterVelocities[j] += (dotI - dotJ) * normal;
+                }
+            }
+        }
+        
+        // Update visuals
+        float alpha = Mathf.Lerp(0.25f, 0.85f, t);
+        for (int i = 0; i < ORBITER_COUNT; i++)
+        {
+            if (_orbiterImages[i] == null) continue;
+            _orbiterImages[i].color = new Color(gaugeColor.r, gaugeColor.g, gaugeColor.b, alpha);
+        }
+    }
+    
+    /// <summary>
     /// Updates infection UI if inventory is currently open
     /// </summary>
     private static void UpdateInfectionUIIfOpen()
@@ -325,29 +467,7 @@ public class Plugin : BaseUnityPlugin
             if (_infectionTextUI == null)
                 CreateOrUpdateInfectionUI();
             
-            if (_infectionTextUI == null)
-                return;
-
-            // Update the text with current infection value
-            _infectionTextUI.text = $"Infection: {_customInfection:F2}%";
-            
-            // Color based on infection level
-            if (_customInfection >= 75f)
-            {
-                _infectionTextUI.color = Color.red;
-            }
-            else if (_customInfection >= 50f)
-            {
-                _infectionTextUI.color = new Color(1f, 0.5f, 0f); // Orange
-            }
-            else if (_customInfection >= 25f)
-            {
-                _infectionTextUI.color = Color.yellow;
-            }
-            else
-            {
-                _infectionTextUI.color = Color.white;
-            }
+            UpdateInfectionText();
         }
         catch (System.Exception ex)
         {
@@ -375,55 +495,105 @@ public class Plugin : BaseUnityPlugin
                 {
                     _infectionUIContainer = existingUI.gameObject;
                     _infectionTextUI = _infectionUIContainer.GetComponentInChildren<TextMeshProUGUI>();
+                    _infectionCircleBg = _infectionUIContainer.transform.Find("CircleBg")?.GetComponent<Image>();
                 }
                 else
                 {
-                    // Create new UI element parented to inventory
+                    // Clone font from an existing in-scene TMP element
+                    TMP_FontAsset gameFont = null;
+                    var existingTmp = inventoryTransform.GetComponentInChildren<TextMeshProUGUI>(true);
+                    if (existingTmp != null)
+                        gameFont = existingTmp.font;
+                    
+                    // Create a procedural circle sprite
+                    var circleSprite = CreateCircleSprite(64);
+                    
+                    // Container
                     _infectionUIContainer = new GameObject("InfectionCounter");
                     _infectionUIContainer.transform.SetParent(inventoryTransform, false);
 
                     var containerRect = _infectionUIContainer.AddComponent<RectTransform>();
                     containerRect.anchorMin = new Vector2(1f, 1f);
                     containerRect.anchorMax = new Vector2(1f, 1f);
-                    containerRect.pivot = new Vector2(1f, 1f);
-                    containerRect.anchoredPosition = new Vector2(450f, 140f);
-                    containerRect.sizeDelta = new Vector2(200, 30);
+                    containerRect.pivot = new Vector2(0.5f, 0.5f);
+                    containerRect.anchoredPosition = new Vector2(350f, 100f);
+                    containerRect.sizeDelta = new Vector2(200, 100);
+                    
+                    // Text label (top)
+                    var textObj = new GameObject("Label");
+                    textObj.transform.SetParent(_infectionUIContainer.transform, false);
+                    var textRect = textObj.AddComponent<RectTransform>();
+                    textRect.anchorMin = new Vector2(0f, 1f);
+                    textRect.anchorMax = new Vector2(1f, 1f);
+                    textRect.pivot = new Vector2(0.5f, 1f);
+                    textRect.anchoredPosition = new Vector2(0f, 0f);
+                    textRect.sizeDelta = new Vector2(200f, 24f);
 
-                    _infectionTextUI = _infectionUIContainer.AddComponent<TextMeshProUGUI>();
+                    _infectionTextUI = textObj.AddComponent<TextMeshProUGUI>();
+                    if (gameFont != null)
+                        _infectionTextUI.font = gameFont;
                     _infectionTextUI.fontSize = 16;
-                    _infectionTextUI.alignment = TextAlignmentOptions.Right;
+                    _infectionTextUI.alignment = TextAlignmentOptions.Center;
                     _infectionTextUI.enableAutoSizing = false;
                     _infectionTextUI.outlineWidth = 0.15f;
                     _infectionTextUI.outlineColor = new Color(0f, 0f, 0f, 0.8f);
                     
+                    // Circle background (dark, behind fill)
+                    var bgObj = new GameObject("CircleBg");
+                    bgObj.transform.SetParent(_infectionUIContainer.transform, false);
+                    var bgRect = bgObj.AddComponent<RectTransform>();
+                    bgRect.anchorMin = new Vector2(0.5f, 0f);
+                    bgRect.anchorMax = new Vector2(0.5f, 0f);
+                    bgRect.pivot = new Vector2(0.5f, 0f);
+                    bgRect.anchoredPosition = new Vector2(0f, 0f);
+                    bgRect.sizeDelta = new Vector2(60f, 60f);
+                    _infectionCircleBg = bgObj.AddComponent<Image>();
+                    _infectionCircleBg.sprite = circleSprite;
+                    _infectionCircleBg.color = new Color(0.15f, 0.15f, 0.15f, 0.7f);
+                    
+                    // Floating circles inside the gauge
+                    var orbitContainer = new GameObject("Orbiters");
+                    orbitContainer.transform.SetParent(_infectionUIContainer.transform, false);
+                    var orbitRect = orbitContainer.AddComponent<RectTransform>();
+                    orbitRect.anchorMin = new Vector2(0.5f, 0f);
+                    orbitRect.anchorMax = new Vector2(0.5f, 0f);
+                    orbitRect.pivot = new Vector2(0.5f, 0.5f);
+                    orbitRect.anchoredPosition = new Vector2(0f, 30f); // Center of the 60px circle
+                    orbitRect.sizeDelta = Vector2.zero;
+                    
+                    var smallCircleSprite = CreateCircleSprite(16);
+                    _orbiterRects = new RectTransform[ORBITER_COUNT];
+                    _orbiterImages = new Image[ORBITER_COUNT];
+                    _orbiterVelocities = new Vector2[ORBITER_COUNT];
+                    _lastOrbiterTime = Time.time;
+                    
+                    for (int i = 0; i < ORBITER_COUNT; i++)
+                    {
+                        var orb = new GameObject($"Orb{i}");
+                        orb.transform.SetParent(orbitContainer.transform, false);
+                        _orbiterRects[i] = orb.AddComponent<RectTransform>();
+                        _orbiterRects[i].sizeDelta = new Vector2(ORBITER_SIZE, ORBITER_SIZE);
+                        
+                        // Random start position inside circle
+                        float angle = Random.Range(0f, Mathf.PI * 2f);
+                        float r = Random.Range(0f, CIRCLE_INNER_RADIUS * 0.6f);
+                        _orbiterRects[i].anchoredPosition = new Vector2(Mathf.Cos(angle) * r, Mathf.Sin(angle) * r);
+                        
+                        // Random initial velocity direction
+                        float vAngle = Random.Range(0f, Mathf.PI * 2f);
+                        _orbiterVelocities[i] = new Vector2(Mathf.Cos(vAngle), Mathf.Sin(vAngle));
+                        
+                        _orbiterImages[i] = orb.AddComponent<Image>();
+                        _orbiterImages[i].sprite = smallCircleSprite;
+                        _orbiterImages[i].color = new Color(0.2f, 0.85f, 0.2f, 0.3f);
+                    }
+                    
                     _infectionUIContainer.SetActive(true);
-                    Logger.LogInfo("[UI] Created infection UI");
+                    Logger.LogInfo("[UI] Created infection UI with circle gauge");
                 }
             }
 
-            // Update the text with current infection value
-            if (_infectionTextUI != null)
-            {
-                _infectionTextUI.text = $"Infection: {_customInfection:F2}%";
-                
-                // Color based on infection level
-                if (_customInfection >= 75f)
-                {
-                    _infectionTextUI.color = Color.red;
-                }
-                else if (_customInfection >= 50f)
-                {
-                    _infectionTextUI.color = new Color(1f, 0.5f, 0f); // Orange
-                }
-                else if (_customInfection >= 25f)
-                {
-                    _infectionTextUI.color = Color.yellow;
-                }
-                else
-                {
-                    _infectionTextUI.color = Color.white;
-                }
-            }
+            UpdateInfectionText();
         }
         catch (System.Exception ex)
         {
@@ -444,6 +614,16 @@ public class Plugin : BaseUnityPlugin
 
             // Kill the player by setting health to 0
             PlayerHelper.SetHealth(player, 0f);
+            
+            // Prevent reviving - mark as permanently dead
+            var pc = player as PlayerController;
+            if (pc != null)
+            {
+                pc.isPermadeath = true;
+                if (pc.reviveArea != null)
+                    pc.reviveArea.enabled = false;
+                Logger.LogInfo("[KillPlayer] Marked player as permanently dead (non-revivable)");
+            }
 
             // Spawn elite zombie using BossSpawner framework
             if (NetworkHelper.IsServer())
@@ -485,5 +665,32 @@ public class Plugin : BaseUnityPlugin
         {
             Logger.LogError($"[UI] Exception: {ex.Message}");
         }
+    }
+    
+    /// <summary>
+    /// Creates a white filled circle sprite procedurally
+    /// </summary>
+    private static Sprite CreateCircleSprite(int resolution)
+    {
+        var tex = new Texture2D(resolution, resolution, TextureFormat.RGBA32, false);
+        float center = resolution / 2f;
+        float radius = center - 1f;
+        
+        for (int y = 0; y < resolution; y++)
+        {
+            for (int x = 0; x < resolution; x++)
+            {
+                float dx = x - center + 0.5f;
+                float dy = y - center + 0.5f;
+                float dist = Mathf.Sqrt(dx * dx + dy * dy);
+                
+                // Anti-aliased edge
+                float alpha = Mathf.Clamp01(radius - dist + 0.5f);
+                tex.SetPixel(x, y, new Color(1f, 1f, 1f, alpha));
+            }
+        }
+        
+        tex.Apply();
+        return Sprite.Create(tex, new Rect(0, 0, resolution, resolution), new Vector2(0.5f, 0.5f));
     }
 }
