@@ -5,34 +5,45 @@ using HarmonyLib;
 using TMPro;
 using UnityEngine.UI;
 using CoreLibrary;
+using System.Reflection;
+using System.Collections;
 
-namespace InfectionGauge;
+namespace InfectionMod;
 
-[BepInPlugin("rer.wmo.mods.infectiongauge", "Infection Gauge", "1.0.0")]
+[BepInPlugin("rer.wmo.mods.infectionmod", "Infection Mod", "1.0.0")]
 [BepInDependency("rer.wmo.mods.corelibrary", BepInDependency.DependencyFlags.HardDependency)]
 public class Plugin : BaseUnityPlugin
 {
     internal static new ManualLogSource Logger;
+
+    private Harmony _harmony;
 
     private const float INFECTION_KILL_THRESHOLD = 100f;  
     private const float INFECTION_CHECK_INTERVAL = 1f; 
     
     // Health-based multipliers
     private const float INFECTION_CAUTION_MULTIPLIER = 3f; 
-    private const float INFECTION_DANGER_MULTIPLIER = 5f;   
+    private const float INFECTION_DANGER_MULTIPLIER = 5f;
     private const float INFECTION_DOWNED_MULTIPLIER = 10f;
     
-    // Health thresholds (as percentages)
+    // Health thresholds (percentages)
     private const float HEALTH_CAUTION_THRESHOLD = 0.5f; 
     private const float HEALTH_DANGER_THRESHOLD = 0.25f;
     
-    // Antivirus item constants
-    private const string ANTIVIRUS_ITEM_ID = "997";
+    // Item constants
+    private const string ANTIVIRAL_ITEM_ID   = "997";
+    private const string ANTIVIRAL_RECIPE_ID = "TemporalAntiviral";
+    private const string ANTIVIRUS_ITEM_ID   = "998";
     private const string ANTIVIRUS_RECIPE_ID = "Antivirus";
-    private const float INFECTION_HEAL_AMOUNT = 20f;
-    private const string CHEMICAL_MATERIAL_ID = "Chemicals";
-    private const int CHEMICAL_AMOUNT = 2;
-    private const string PLACEHOLDER_BASE_ITEM_ID = "213"; // Tonic sprite
+    private const float  INFECTION_HEAL_AMOUNT    = 20f;
+    private const float  INFECTION_PAUSE_DURATION = 120f;
+    private const string CHEMICAL_MATERIAL_ID  = "Chemicals";
+    private const string SCRAPS_MATERIAL_ID    = "Scraps";
+    private const string RED_HERB_SOURCE_ID    = "202"; // Red Herb sprite → Temporal Antiviral
+    private const string BLUE_HERB_SOURCE_ID   = "203"; // Blue Herb sprite → Antivirus
+
+    // Damage-based infection amplification
+    private const float INFECTION_HIT_INCREASE   = 1.5f;   // any enemy hit (melee, ranged, status)
     
     private static System.Collections.Generic.Dictionary<string, float> _jobInfectionRates = new System.Collections.Generic.Dictionary<string, float>();
     private static bool _jobRatesInitialized = false;
@@ -42,13 +53,14 @@ public class Plugin : BaseUnityPlugin
     
     // Custom infection tracker
     private static float _customInfection = 0f;
+    private static float _infectionPausedUntil = 0f;
     private static int _lastLoggedMilestone = 0;
     private static string _currentLevel = "";
     private static bool _hasLoggedLobbyStatus = false;
     
     private static string _currentPlayerJob = "Default";
     
-    // UI elements
+    // UI
     private static TextMeshProUGUI _infectionTextUI = null;
     private static Image _infectionCircleBg = null;
     private static GameObject _infectionUIContainer = null;
@@ -56,44 +68,48 @@ public class Plugin : BaseUnityPlugin
     private static Image[] _orbiterImages = null;
     private static Vector2[] _orbiterVelocities = null;
     private const int ORBITER_COUNT = 5;
-    private const float CIRCLE_INNER_RADIUS = 25f; // Stay inside the 60px circle
+    private const float CIRCLE_INNER_RADIUS = 25f;
     private const float ORBITER_SIZE = 5f;
     private static float _lastOrbiterTime = 0f;
 
     private void Awake()
     {
         Logger = base.Logger;
-        Logger.LogInfo("=== INFECTION GAUGE PLUGIN INITIALIZED (v2.0) ===");
-        
-        // Register antivirus item and recipe
-        RegisterAntivirusItem();
-        
-        // Subscribe to CoreLibrary game events
-        GameEvents.OnDataManagerAwake += OnDataManagerAwake;
-        GameEvents.OnPlayerUpdate += OnPlayerUpdate;
-        GameEvents.OnInventoryShown += OnInventoryShown;
-        
-        Logger.LogInfo("Subscribed to game events via CoreLibrary!");
+        Logger.LogInfo("[InfectionMod] Awake() start");
+
+        try { RegisterItems(); }
+        catch (System.Exception ex) { Logger.LogError($"[InfectionMod] RegisterItems failed: {ex}"); }
+
+        try
+        {
+            GameEvents.OnDataManagerAwake += OnDataManagerAwake;
+            GameEvents.OnPlayerUpdate += OnPlayerUpdate;
+            GameEvents.OnInventoryShown += OnInventoryShown;
+            Logger.LogInfo("[InfectionMod] CoreLibrary events subscribed.");
+        }
+        catch (System.Exception ex) { Logger.LogError($"[InfectionMod] Event subscription failed: {ex}"); }
+
+        Logger.LogInfo("[InfectionMod] Awake() complete.");
     }
+
+    private void OnDestroy() => _harmony?.UnpatchSelf();
     
-    private static void RegisterAntivirusItem()
+    private static void RegisterItems()
     {
         try
         {
-            Logger.LogInfo("[Antivirus] Registering antivirus item and recipe...");
-            
-            // Register the item
-            var antivirusItem = new CoreLibrary.CustomItemDefinition
+            // --- Temporal Antiviral (997) — Red Herb sprite, lowers infection by 20% ---
+            var antiviralItem = new CoreLibrary.CustomItemDefinition
             {
-                ItemId = ANTIVIRUS_ITEM_ID,
-                ItemName = "Antivirus",
+                ItemId = ANTIVIRAL_ITEM_ID,
+                ItemName = "Temporal Antiviral",
                 ItemDescription = "Lowers total infection rate by 20%",
-                ItemType = 3, // Health item
-                ItemCategory = 0, // Medical
+                ItemType = 3, // HealingItem
+                ItemCategory = 0,
                 IsUsable = true,
                 IsStackable = false,
                 MaxStack = 10,
-                SpriteSourceItemId = PLACEHOLDER_BASE_ITEM_ID,
+                SpriteSourceItemId = RED_HERB_SOURCE_ID,
                 OnItemUsed = (invObj) =>
                 {
                     _customInfection = Mathf.Max(0f, _customInfection - INFECTION_HEAL_AMOUNT);
@@ -101,34 +117,63 @@ public class Plugin : BaseUnityPlugin
                     UpdateInfectionText();
                 }
             };
-            
-            CoreLibrary.CustomItemHelper.RegisterItem(antivirusItem);
-            
-            var antivirusRecipe = new CoreLibrary.CustomRecipeDefinition
+            CoreLibrary.CustomItemHelper.RegisterItem(antiviralItem);
+
+            var antiviralRecipe = new CoreLibrary.CustomRecipeDefinition
             {
-                RecipeId = ANTIVIRUS_RECIPE_ID,
-                ItemId = ANTIVIRUS_ITEM_ID,
-                CraftStation = 1, // Workbench
-                RecipeItemType = 1, // Medicine
+                RecipeId = ANTIVIRAL_RECIPE_ID,
+                ItemId = ANTIVIRAL_ITEM_ID,
+                CraftStation = 1,
+                RecipeItemType = 1,
                 RecipeCategory = 0,
                 CraftAmount = 1,
                 Ingredients = new System.Collections.Generic.List<CoreLibrary.RecipeIngredient>
                 {
-                    new CoreLibrary.RecipeIngredient
-                    {
-                        MaterialId = CHEMICAL_MATERIAL_ID,
-                        Amount = CHEMICAL_AMOUNT
-                    }
+                    new CoreLibrary.RecipeIngredient { MaterialId = SCRAPS_MATERIAL_ID, Amount = 10 }
                 }
             };
-            
+            CoreLibrary.CustomItemHelper.RegisterRecipe(antiviralRecipe);
+
+            // --- Antivirus (998) — Blue Herb sprite, pauses infection for 120 seconds ---
+            var antivirusItem = new CoreLibrary.CustomItemDefinition
+            {
+                ItemId = ANTIVIRUS_ITEM_ID,
+                ItemName = "Antivirus",
+                ItemDescription = "Pauses infection spread for 2 minutes",
+                ItemType = 3, // HealingItem
+                ItemCategory = 0,
+                IsUsable = true,
+                IsStackable = false,
+                MaxStack = 10,
+                SpriteSourceItemId = BLUE_HERB_SOURCE_ID,
+                OnItemUsed = (invObj) =>
+                {
+                    _infectionPausedUntil = Time.time + INFECTION_PAUSE_DURATION;
+                    UpdateInfectionText();
+                }
+            };
+            CoreLibrary.CustomItemHelper.RegisterItem(antivirusItem);
+
+            var antivirusRecipe = new CoreLibrary.CustomRecipeDefinition
+            {
+                RecipeId = ANTIVIRUS_RECIPE_ID,
+                ItemId = ANTIVIRUS_ITEM_ID,
+                CraftStation = 1,
+                RecipeItemType = 1,
+                RecipeCategory = 0,
+                CraftAmount = 1,
+                Ingredients = new System.Collections.Generic.List<CoreLibrary.RecipeIngredient>
+                {
+                    new CoreLibrary.RecipeIngredient { MaterialId = CHEMICAL_MATERIAL_ID, Amount = 2 }
+                }
+            };
             CoreLibrary.CustomItemHelper.RegisterRecipe(antivirusRecipe);
-            
-            Logger.LogInfo($"[Antivirus] Item ID: {ANTIVIRUS_ITEM_ID}, Recipe: {ANTIVIRUS_RECIPE_ID}");
+
+            Logger.LogInfo($"[Items] Registered Temporal Antiviral ({ANTIVIRAL_ITEM_ID}) and Antivirus ({ANTIVIRUS_ITEM_ID})");
         }
         catch (System.Exception ex)
         {
-            Logger.LogError($"[Antivirus] Failed to register: {ex.Message}");
+            Logger.LogError($"[Items] Failed to register: {ex.Message}");
         }
     }
     
@@ -150,11 +195,6 @@ public class Plugin : BaseUnityPlugin
             _jobInfectionRates["MEDIC"] = 0.0211f;
             _jobInfectionRates["FIREFIGHTER"] = 0.0311f;
 
-            foreach (var kv in _jobInfectionRates)
-            {
-                Logger.LogInfo($"[JobInfection] Perk '{kv.Key}' Infection Rate: {kv.Value:F4}");
-            }
-
             _jobRatesInitialized = true;
         }
         catch (System.Exception ex)
@@ -163,9 +203,6 @@ public class Plugin : BaseUnityPlugin
         }
     }
     
-    /// <summary>
-    /// Gets the base Infection Rate for a specific job
-    /// </summary>
     private static float GetJobInfectionRate(string jobId)
     {
         const float DEFAULT_RATE = 0.0185f;
@@ -191,16 +228,31 @@ public class Plugin : BaseUnityPlugin
         return DEFAULT_RATE;
     }
     
-    private static void OnDataManagerAwake()
+    private void OnDataManagerAwake()
     {
         try
         {
-            Logger.LogInfo("[Init] DataManager awakened, initializing infection rates...");
             InitializeJobInfectionRates();
         }
         catch (System.Exception ex)
         {
             Logger.LogError($"[Init] Failed to initialize: {ex.Message}");
+        }
+
+        // Apply Harmony patches here — DataManager.Awake fires well after HarmonyX
+        // finalization, so patches will not be clobbered by the Chainloader finalization pass.
+        if (_harmony == null)
+        {
+            try
+            {
+                _harmony = new Harmony("rer.wmo.mods.infectionmod");
+                _harmony.PatchAll(typeof(AddSubHealthPatch));
+                Logger.LogInfo("[InfectionMod] Harmony patches applied (PlayerNetwork.AddSubHealth).");
+            }
+            catch (System.Exception ex)
+            {
+                Logger.LogError($"[InfectionMod] Harmony patching failed in OnDataManagerAwake: {ex}");
+            }
         }
     }
     
@@ -208,13 +260,13 @@ public class Plugin : BaseUnityPlugin
     {
         try
         {
-            // Check if in game level
             string currentLevel = UnityEngine.SceneManagement.SceneManager.GetActiveScene().name;
             if (currentLevel != _currentLevel)
             {
                 _currentLevel = currentLevel;
                 _hasLoggedLobbyStatus = false;
                 _hasLoggedKill = false;
+                _infectionPausedUntil = 0f;
                 
                 // Clear stale Unity object references from previous scene
                 _infectionTextUI = null;
@@ -225,7 +277,6 @@ public class Plugin : BaseUnityPlugin
                 _orbiterVelocities = null;
             }
 
-            // Exit early if in lobby - don't increase infection
             bool isInLobby = currentLevel.Contains("Lobby") || currentLevel.Contains("lobby");
             if (isInLobby)
             {
@@ -242,23 +293,18 @@ public class Plugin : BaseUnityPlugin
                         Logger.LogInfo("[Lobby] Reset permadeath state - player alive with infection");
                     }
                 }
-                // Still update UI in lobby so the gauge animation runs
                 UpdateInfectionUIIfOpen();
                 return;
             }
 
-            // Get player job
             try
             {
                 string perkId = PlayerHelper.GetPerkId(player);
                 
-                // Only update if perk actually changed
                 if (!string.IsNullOrEmpty(perkId) && _currentPlayerJob != perkId)
                 {
                     _currentPlayerJob = perkId;
                     float jobInfectionRate = GetJobInfectionRate(_currentPlayerJob);
-                    Logger.LogInfo($"[Job] Perk ID: {perkId}");
-                    Logger.LogInfo($"[Job] Infection Base Rate: {jobInfectionRate:F4}/s");
                 }
             }
             catch (System.Exception ex)
@@ -266,7 +312,6 @@ public class Plugin : BaseUnityPlugin
                 Logger.LogError($"[Job] Exception getting perk: {ex.Message}");
             }
 
-            // Update infection
             float currentTime = Time.time;
             if (currentTime - _lastCheckTime >= INFECTION_CHECK_INTERVAL)
             {
@@ -274,10 +319,8 @@ public class Plugin : BaseUnityPlugin
                 UpdateInfection(player);
             }
             
-            // Update UI if inventory is open
             UpdateInfectionUIIfOpen();
 
-            // Check for death
             if (_customInfection >= INFECTION_KILL_THRESHOLD && !_hasLoggedKill)
             {
                 _hasLoggedKill = true;
@@ -290,18 +333,21 @@ public class Plugin : BaseUnityPlugin
         }
     }
     
-    /// <summary>
-    /// Updates the player's infection level
-    /// </summary>
     private static void UpdateInfection(object player)
     {
         try
         {
-            // Check if player is downed
+            if (Time.time < _infectionPausedUntil) return;
+
             float currentHealth = PlayerHelper.GetHealth(player);
             if (currentHealth <= 0f)
             {
-                _customInfection = 0f;
+                // Player is downed — accumulate at maximum (10x) rate; very punishing
+                _customInfection = Mathf.Min(INFECTION_KILL_THRESHOLD,
+                    _customInfection + GetJobInfectionRate(_currentPlayerJob) * INFECTION_DOWNED_MULTIPLIER);
+                int downedMilestone = Mathf.FloorToInt(_customInfection / 10f);
+                if (downedMilestone > _lastLoggedMilestone)
+                    _lastLoggedMilestone = downedMilestone;
                 return;
             }
 
@@ -322,12 +368,10 @@ public class Plugin : BaseUnityPlugin
             float increaseAmount = baseRate * multiplier;
             _customInfection = Mathf.Min(INFECTION_KILL_THRESHOLD, _customInfection + increaseAmount);
 
-            // Log milestones
             int currentMilestone = Mathf.FloorToInt(_customInfection / 10f);
             if (currentMilestone > _lastLoggedMilestone)
             {
                 _lastLoggedMilestone = currentMilestone;
-                Logger.LogInfo($"[Infection] Reached {currentMilestone * 10}% infection");
             }
         }
         catch (System.Exception ex)
@@ -335,10 +379,7 @@ public class Plugin : BaseUnityPlugin
             Logger.LogError($"[Update] Exception updating infection: {ex.Message}");
         }
     }
-    
-    /// <summary>
-    /// Updates the infection text and color on the UI element
-    /// </summary>
+
     private static void UpdateInfectionText()
     {
         if (_infectionTextUI == null)
@@ -374,14 +415,17 @@ public class Plugin : BaseUnityPlugin
             return new Color(0.95f, 0.85f, 0.1f, 1f);      // Yellow
         if (infection < 90f)
             return new Color(0.9f, 0.15f, 0.1f, 1f);       // Red
-        return new Color(0.5f, 0.05f, 0.05f, 1f);           // Dark red
+
+        return new Color(0.5f, 0.05f, 0.05f, 1f);          // Dark red
     }
     
     private static void UpdateOrbiters(float t, Color gaugeColor)
     {
         if (_orbiterRects == null || _orbiterImages == null || _orbiterVelocities == null)
             return;
-        
+
+        if (Time.time < _infectionPausedUntil) return;
+
         float currentTime = Time.time;
         float dt = Mathf.Min(currentTime - _lastOrbiterTime, 0.05f);
         _lastOrbiterTime = currentTime;
@@ -391,7 +435,6 @@ public class Plugin : BaseUnityPlugin
         float speed = 15f + t * 40f;
         float orbiterRadius = ORBITER_SIZE * 0.5f;
         
-        // Move each orbiter
         for (int i = 0; i < ORBITER_COUNT; i++)
         {
             if (_orbiterRects[i] == null) continue;
@@ -399,12 +442,10 @@ public class Plugin : BaseUnityPlugin
             Vector2 pos = _orbiterRects[i].anchoredPosition;
             pos += _orbiterVelocities[i] * speed * dt;
             
-            // Bounce off circle boundary
             float dist = pos.magnitude;
             float maxDist = CIRCLE_INNER_RADIUS - orbiterRadius;
             if (dist > maxDist && dist > 0f)
             {
-                // Reflect velocity off the circle wall
                 Vector2 normal = pos.normalized;
                 _orbiterVelocities[i] = _orbiterVelocities[i] - 2f * Vector2.Dot(_orbiterVelocities[i], normal) * normal;
                 pos = normal * maxDist;
@@ -413,7 +454,6 @@ public class Plugin : BaseUnityPlugin
             _orbiterRects[i].anchoredPosition = pos;
         }
         
-        // Check collisions between orbiters
         for (int i = 0; i < ORBITER_COUNT; i++)
         {
             if (_orbiterRects[i] == null) continue;
@@ -430,12 +470,10 @@ public class Plugin : BaseUnityPlugin
                 if (distSq < minDist * minDist && distSq > 0.001f)
                 {
                     Vector2 normal = diff.normalized;
-                    // Push apart
                     float overlap = minDist - Mathf.Sqrt(distSq);
                     _orbiterRects[i].anchoredPosition = posA + normal * (overlap * 0.5f);
                     _orbiterRects[j].anchoredPosition = posB - normal * (overlap * 0.5f);
                     
-                    // Swap velocity components along collision normal
                     float dotI = Vector2.Dot(_orbiterVelocities[i], normal);
                     float dotJ = Vector2.Dot(_orbiterVelocities[j], normal);
                     _orbiterVelocities[i] += (dotJ - dotI) * normal;
@@ -444,7 +482,6 @@ public class Plugin : BaseUnityPlugin
             }
         }
         
-        // Update visuals
         float alpha = Mathf.Lerp(0.25f, 0.85f, t);
         for (int i = 0; i < ORBITER_COUNT; i++)
         {
@@ -453,9 +490,6 @@ public class Plugin : BaseUnityPlugin
         }
     }
     
-    /// <summary>
-    /// Updates infection UI if inventory is currently open
-    /// </summary>
     private static void UpdateInfectionUIIfOpen()
     {
         try
@@ -463,7 +497,6 @@ public class Plugin : BaseUnityPlugin
             if (!UIHelper.IsInventoryOpen())
                 return;
             
-            // Create UI if it doesn't exist yet
             if (_infectionTextUI == null)
                 CreateOrUpdateInfectionUI();
             
@@ -475,9 +508,6 @@ public class Plugin : BaseUnityPlugin
         }
     }
     
-    /// <summary>
-    /// Creates or updates the infection UI display
-    /// </summary>
     private static void CreateOrUpdateInfectionUI()
     {
         try
@@ -486,7 +516,6 @@ public class Plugin : BaseUnityPlugin
             if (inventoryTransform == null)
                 return;
 
-            // Find or create the infection UI
             if (_infectionTextUI == null)
             {
                 var existingUI = inventoryTransform.Find("InfectionCounter");
@@ -499,16 +528,13 @@ public class Plugin : BaseUnityPlugin
                 }
                 else
                 {
-                    // Clone font from an existing in-scene TMP element
                     TMP_FontAsset gameFont = null;
                     var existingTmp = inventoryTransform.GetComponentInChildren<TextMeshProUGUI>(true);
                     if (existingTmp != null)
                         gameFont = existingTmp.font;
                     
-                    // Create a procedural circle sprite
                     var circleSprite = CreateCircleSprite(64);
                     
-                    // Container
                     _infectionUIContainer = new GameObject("InfectionCounter");
                     _infectionUIContainer.transform.SetParent(inventoryTransform, false);
 
@@ -519,7 +545,7 @@ public class Plugin : BaseUnityPlugin
                     containerRect.anchoredPosition = new Vector2(350f, 100f);
                     containerRect.sizeDelta = new Vector2(200, 100);
                     
-                    // Text label (top)
+                    // top
                     var textObj = new GameObject("Label");
                     textObj.transform.SetParent(_infectionUIContainer.transform, false);
                     var textRect = textObj.AddComponent<RectTransform>();
@@ -538,7 +564,7 @@ public class Plugin : BaseUnityPlugin
                     _infectionTextUI.outlineWidth = 0.15f;
                     _infectionTextUI.outlineColor = new Color(0f, 0f, 0f, 0.8f);
                     
-                    // Circle background (dark, behind fill)
+                    // Circle background
                     var bgObj = new GameObject("CircleBg");
                     bgObj.transform.SetParent(_infectionUIContainer.transform, false);
                     var bgRect = bgObj.AddComponent<RectTransform>();
@@ -551,7 +577,7 @@ public class Plugin : BaseUnityPlugin
                     _infectionCircleBg.sprite = circleSprite;
                     _infectionCircleBg.color = new Color(0.15f, 0.15f, 0.15f, 0.7f);
                     
-                    // Floating circles inside the gauge
+                    // Floating circles
                     var orbitContainer = new GameObject("Orbiters");
                     orbitContainer.transform.SetParent(_infectionUIContainer.transform, false);
                     var orbitRect = orbitContainer.AddComponent<RectTransform>();
@@ -601,18 +627,12 @@ public class Plugin : BaseUnityPlugin
         }
     }
     
-    /// <summary>
-    /// Kills the player and spawns an elite zombie at their location
-    /// </summary>
     private static void KillPlayerFromInfection(object player)
     {
         try
         {
-            Logger.LogWarning("=== EXECUTING INSTANT DEATH + ELITE SPAWN DUE TO INFECTION ===");
-
             var deathPosition = PlayerHelper.GetPosition(player);
 
-            // Kill the player by setting health to 0
             PlayerHelper.SetHealth(player, 0f);
             
             // Prevent reviving - mark as permanently dead
@@ -622,30 +642,18 @@ public class Plugin : BaseUnityPlugin
                 pc.isPermadeath = true;
                 if (pc.reviveArea != null)
                     pc.reviveArea.enabled = false;
-                Logger.LogInfo("[KillPlayer] Marked player as permanently dead (non-revivable)");
             }
 
-            // Spawn elite zombie using BossSpawner framework
             if (NetworkHelper.IsServer())
             {
-                Logger.LogInfo("[KillPlayer] Server is spawning elite enemy...");
                 bool spawnSuccess = CoreLibrary.EliteSpawnHelper.SpawnEliteAtPosition(deathPosition);
-                
-                if (spawnSuccess)
-                {
-                    Logger.LogInfo("[KillPlayer] ✓ Elite enemy spawned successfully!");
-                }
-                else
-                {
-                    Logger.LogError("[KillPlayer] Failed to spawn elite enemy");
-                }
+            
             }
             else
             {
                 Logger.LogInfo("[KillPlayer] Client detected death - server will spawn elite");
             }
 
-            Logger.LogWarning("=== INSTANT DEATH + ELITE SPAWN EXECUTED ===");
         }
         catch (System.Exception ex)
         {
@@ -658,7 +666,6 @@ public class Plugin : BaseUnityPlugin
     {
         try
         {
-            // Create or update infection UI
             CreateOrUpdateInfectionUI();
         }
         catch (System.Exception ex)
@@ -667,9 +674,6 @@ public class Plugin : BaseUnityPlugin
         }
     }
     
-    /// <summary>
-    /// Creates a white filled circle sprite procedurally
-    /// </summary>
     private static Sprite CreateCircleSprite(int resolution)
     {
         var tex = new Texture2D(resolution, resolution, TextureFormat.RGBA32, false);
@@ -692,5 +696,87 @@ public class Plugin : BaseUnityPlugin
         
         tex.Apply();
         return Sprite.Create(tex, new Rect(0, 0, resolution, resolution), new Vector2(0.5f, 0.5f));
+    }
+
+    // -------------------------------------------------------------------------
+    // Damage-based infection
+    // -------------------------------------------------------------------------
+
+    private static bool IsInMission()
+    {
+        string level = UnityEngine.SceneManagement.SceneManager.GetActiveScene().name;
+        return !level.Contains("Lobby") && !level.Contains("lobby");
+    }
+
+    private static void ApplyHitInfection(string source)
+    {
+        if (!IsInMission())
+        {
+            Logger.LogInfo($"[DmgInfection] {source} — skipped (not in mission)");
+            return;
+        }
+        if (Time.time < _infectionPausedUntil)
+        {
+            Logger.LogInfo($"[DmgInfection] {source} — skipped (infection paused)");
+            return;
+        }
+        float before = _customInfection;
+        _customInfection = Mathf.Min(INFECTION_KILL_THRESHOLD, _customInfection + INFECTION_HIT_INCREASE);
+        _lastLoggedMilestone = Mathf.FloorToInt(_customInfection / 10f);
+        Logger.LogInfo($"[DmgInfection] {source} HIT +{INFECTION_HIT_INCREASE}% → {before:F2} → {_customInfection:F2}");
+        UpdateInfectionText();
+    }
+
+    // Called by collider patch classes
+    public static void OnEnemyHit(string source)
+    {
+        Logger.LogInfo($"[DmgInfection] {source} — enemy hit callback fired");
+        ApplyHitInfection(source);
+    }
+
+    // Exposed for the patch class to read in log messages
+    public static float GetCurrentInfection() => _customInfection;
+
+    // -------------------------------------------------------------------------
+    // Harmony patches — plain MonoBehaviour colliders (not Fusion-woven)
+    // -------------------------------------------------------------------------
+}
+
+// Patches PlayerNetwork.AddSubHealth — a plain MonoBehaviour method (not Fusion-woven).
+// Fires AFTER the guards inside AddSubHealth have already been evaluated, but BEFORE
+// the value is written to the network. The `value` parameter here is the ORIGINAL
+// pre-scaled float (negative = damage, positive = heal).
+//
+// We mirror the same invincibility guards that AddSubHealth uses so we only count
+// hits where HP was actually reduced.
+//
+// Verification: search BepInEx/LogOutput.log for "[DmgInfection] AddSubHealth fired"
+// after taking any enemy hit. If it never appears, the patch is not being applied.
+[HarmonyPatch(typeof(PlayerNetwork), nameof(PlayerNetwork.AddSubHealth))]
+internal static class AddSubHealthPatch
+{
+    [HarmonyPrefix]
+    public static void Prefix(PlayerNetwork __instance, float value)
+    {
+        // Only damage (negative value), not heals or regen
+        if (value >= 0f) return;
+
+        // Only the local player's client
+        if (!__instance.isLocalPlayer) return;
+
+        // Mirror the invincibleTimer guard from AddSubHealth itself —
+        // if invincibility would block the damage, don't count it as a hit.
+        if (__instance.playerController == null) return;
+        if (__instance.playerController.invincibleTimer.isRunning) return;
+
+        // Mirror the dead check — don't add infection to an already-downed player
+        // via direct damage (the passive infection tick handles downed state separately).
+        if (__instance.playerController.network.GetHealth() <= 0f) return;
+
+        InfectionMod.Plugin.Logger.LogInfo(
+            $"[DmgInfection] AddSubHealth fired — raw value={value:F4}, " +
+            $"infection before={InfectionMod.Plugin.GetCurrentInfection():F2}");
+
+        InfectionMod.Plugin.OnEnemyHit("EnemyDamage");
     }
 }

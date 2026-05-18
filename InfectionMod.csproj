@@ -43,9 +43,11 @@
   </ItemGroup>
 
   <PropertyGroup>
-    <ModName>Infection Gauge</ModName>
-    <ModUniqueID>rer.wmo.mods.infectiongauge</ModUniqueID>
-    <ModDescription>Infection gauge system for WMO</ModDescription>
+    <GenerateModManifest>true</GenerateModManifest>
+    <ModName>Infection Mod</ModName>
+    <ModUniqueID>rer.wmo.mods.infectionmod</ModUniqueID>
+    <ModVersion>1.0.0</ModVersion>
+    <ModDescription>Infection mechanic mod for WMO</ModDescription>
   </PropertyGroup>
 
   <ItemGroup>
