@@ -8,6 +8,9 @@ using CoreLibrary;
 using System.Reflection;
 using System.Collections;
 
+// Adds a passive infection mechanic that can kill players — directly affects gameplay.
+[assembly: CoreLibrary.AffectsGameplay(true)]
+
 namespace InfectionMod;
 
 [BepInPlugin("rer.wmo.mods.infectionmod", "Infection Mod", "1.0.0")]
@@ -56,11 +59,52 @@ public class Plugin : BaseUnityPlugin
     private static float _infectionPausedUntil = 0f;
     private static int _lastLoggedMilestone = 0;
     private static string _currentLevel = "";
-    private static bool _hasLoggedLobbyStatus = false;
+
+    // SFX
+    private const float INFECTION_HEARTBEAT_THRESHOLD = 90f;
+    private static bool _infectionHeartbeatPlaying = false;
+    // AudioManager is internal — access via cached reflection
+    private static MethodInfo _audioPlaySFX = null;
+    private static MethodInfo _audioStopSFX = null;
+
+    private static void EnsureAudioReflection()
+    {
+        if (_audioPlaySFX != null) return;
+        var audioType = typeof(PlayerController).Assembly.GetType("Toked.AudioManager");
+        if (audioType == null) { Logger.LogError("[SFX] Could not find Toked.AudioManager via reflection"); return; }
+        _audioPlaySFX = audioType.GetMethod("PlaySFX", BindingFlags.Public | BindingFlags.Static,
+            null, new[] { typeof(string) }, null);
+        _audioStopSFX = audioType.GetMethod("StopSFX", BindingFlags.Public | BindingFlags.Static,
+            null, new[] { typeof(string) }, null);
+    }
     
     private static string _currentPlayerJob = "Default";
+
+    // Milestone notifications (every 10%)
+    // Monologue term IDs for the speech bubble sent to all players at 50% and 90%.
+    // We register these as custom I2 Localization terms at startup.
+    private const int MONOLOGUE_ID_50  = 9990;   // "Interaction/Monologue-9990"
+    private const int MONOLOGUE_ID_90  = 9991;   // "Interaction/Monologue-9991"
+    private static readonly int[] CHAT_BUBBLE_MILESTONES = { 50, 90 };
+    private static readonly int[] MONOLOGUE_IDS           = { MONOLOGUE_ID_50, MONOLOGUE_ID_90 };
+
+    // Rotating on-screen messages for the 10% milestones (local notification only).
+    // Two pools: below 50% (mild) and 50%+ (severe). Picked by milestone index so
+    // messages escalate naturally as infection climbs.
+    private static readonly string[] MILD_MESSAGES = {
+        "You feel more sickly...",
+        "You have a headache...",
+        "Your skin feels warm...",
+        "You feel a slight dizziness...",
+    };
+    private static readonly string[] SEVERE_MESSAGES = {
+        "Your vision blurs for a moment...",
+        "Your hands are trembling...",
+        "You can barely keep your eyes open...",
+        "Something is very wrong...",
+    };
+
     
-    // UI
     private static TextMeshProUGUI _infectionTextUI = null;
     private static Image _infectionCircleBg = null;
     private static GameObject _infectionUIContainer = null;
@@ -239,6 +283,20 @@ public class Plugin : BaseUnityPlugin
             Logger.LogError($"[Init] Failed to initialize: {ex.Message}");
         }
 
+        // Register custom monologue terms used by the speech bubble at 50% and 90%.
+        // LocalizationHelper maps these to "Interaction/Monologue-{id}" which is what
+        // ChatSystem.ShowBaloonChat looks up for ChatType.MONOLOGUE.
+        try
+        {
+            LocalizationHelper.RegisterTerm($"Interaction/Monologue-{MONOLOGUE_ID_50}", "I don't feel so good...");
+            LocalizationHelper.RegisterTerm($"Interaction/Monologue-{MONOLOGUE_ID_90}", "I don't feel so good...");
+            Logger.LogInfo("[InfectionMod] Monologue localization terms registered.");
+        }
+        catch (System.Exception ex)
+        {
+            Logger.LogError($"[InfectionMod] Localization registration failed: {ex.Message}");
+        }
+
         // Apply Harmony patches here — DataManager.Awake fires well after HarmonyX
         // finalization, so patches will not be clobbered by the Chainloader finalization pass.
         if (_harmony == null)
@@ -247,7 +305,8 @@ public class Plugin : BaseUnityPlugin
             {
                 _harmony = new Harmony("rer.wmo.mods.infectionmod");
                 _harmony.PatchAll(typeof(AddSubHealthPatch));
-                Logger.LogInfo("[InfectionMod] Harmony patches applied (PlayerNetwork.AddSubHealth).");
+                _harmony.PatchAll(typeof(InfectionReviveTimerPatch));
+                Logger.LogInfo("[InfectionMod] Harmony patches applied (PlayerNetwork.AddSubHealth, PlayerController.FixedUpdate).");
             }
             catch (System.Exception ex)
             {
@@ -261,13 +320,16 @@ public class Plugin : BaseUnityPlugin
         try
         {
             string currentLevel = UnityEngine.SceneManagement.SceneManager.GetActiveScene().name;
+            bool isInLobby = currentLevel.Contains("Lobby") || currentLevel.Contains("lobby");
+
             if (currentLevel != _currentLevel)
             {
                 _currentLevel = currentLevel;
-                _hasLoggedLobbyStatus = false;
                 _hasLoggedKill = false;
                 _infectionPausedUntil = 0f;
-                
+                _infectionKillPlayerIdx = -1;
+                _infectionHeartbeatPlaying = false; // flag reset; actual StopSFX handled per-branch below
+
                 // Clear stale Unity object references from previous scene
                 _infectionTextUI = null;
                 _infectionCircleBg = null;
@@ -275,24 +337,25 @@ public class Plugin : BaseUnityPlugin
                 _orbiterRects = null;
                 _orbiterImages = null;
                 _orbiterVelocities = null;
-            }
 
-            bool isInLobby = currentLevel.Contains("Lobby") || currentLevel.Contains("lobby");
-            if (isInLobby)
-            {
-                if (!_hasLoggedLobbyStatus)
+                // On every lobby entry: clear any local permadeath state so the
+                // player appears alive (infection total persists intentionally —
+                // they can use Antivirus between missions).
+                if (isInLobby)
                 {
-                    _hasLoggedLobbyStatus = true;
-                    
-                    // Reset permadeath state so player is alive in lobby
-                    // (infection stays, giving them a chance to use antivirus)
                     var pc = player as PlayerController;
                     if (pc != null && pc.isPermadeath)
                     {
                         pc.isPermadeath = false;
-                        Logger.LogInfo("[Lobby] Reset permadeath state - player alive with infection");
+                        Logger.LogInfo("[Lobby] Reset permadeath state on level change - player alive with infection");
                     }
+                    StopInfectionHeartbeat(pc);
+                    Logger.LogInfo($"[Lobby] Entered lobby scene '{currentLevel}', infection={_customInfection:F2}%");
                 }
+            }
+
+            if (isInLobby)
+            {
                 UpdateInfectionUIIfOpen();
                 return;
             }
@@ -320,6 +383,7 @@ public class Plugin : BaseUnityPlugin
             }
             
             UpdateInfectionUIIfOpen();
+            UpdateInfectionHeartbeat(player);
 
             if (_customInfection >= INFECTION_KILL_THRESHOLD && !_hasLoggedKill)
             {
@@ -347,7 +411,11 @@ public class Plugin : BaseUnityPlugin
                     _customInfection + GetJobInfectionRate(_currentPlayerJob) * INFECTION_DOWNED_MULTIPLIER);
                 int downedMilestone = Mathf.FloorToInt(_customInfection / 10f);
                 if (downedMilestone > _lastLoggedMilestone)
+                {
+                    int newMilestone = downedMilestone * 10;
                     _lastLoggedMilestone = downedMilestone;
+                    FireMilestoneNotification(player, newMilestone);
+                }
                 return;
             }
 
@@ -371,7 +439,9 @@ public class Plugin : BaseUnityPlugin
             int currentMilestone = Mathf.FloorToInt(_customInfection / 10f);
             if (currentMilestone > _lastLoggedMilestone)
             {
+                int newMilestone = currentMilestone * 10; // e.g. 3 → 30%
                 _lastLoggedMilestone = currentMilestone;
+                FireMilestoneNotification(player, newMilestone);
             }
         }
         catch (System.Exception ex)
@@ -627,33 +697,152 @@ public class Plugin : BaseUnityPlugin
         }
     }
     
+    private static void FireMilestoneNotification(object player, int milestone)
+    {
+        try
+        {
+            // ── One-shot heartbeat thump ──────────────────────────────────────
+            // Play once regardless of the looping heartbeat state — it acts as
+            // an audio "punctuation" for the milestone crossing.
+            EnsureAudioReflection();
+            _audioPlaySFX?.Invoke(null, new object[] { "ui-heartbeat" });
+
+            // ── On-screen message (local only) ────────────────────────────────
+            if (UIGameManager.Instance != null)
+            {
+                string msg;
+                if (milestone >= 50)
+                {
+                    int idx = ((milestone / 10) - 5) % SEVERE_MESSAGES.Length; // 50→0, 60→1, 70→2, 80→3, 90→0...
+                    msg = SEVERE_MESSAGES[idx];
+                }
+                else
+                {
+                    int idx = ((milestone / 10) - 1) % MILD_MESSAGES.Length;   // 10→0, 20→1, 30→2, 40→3
+                    msg = MILD_MESSAGES[idx];
+                }
+                UIGameManager.Instance.ShowPlayerInfo(msg);
+            }
+
+            // ── Speech bubble RPC at 50% and 90% (visible to all players) ────
+            for (int i = 0; i < CHAT_BUBBLE_MILESTONES.Length; i++)
+            {
+                if (milestone == CHAT_BUBBLE_MILESTONES[i])
+                {
+                    var pc = player as PlayerController;
+                    if (pc != null)
+                        pc.network.ShowBaloonChat(ChatType.MONOLOGUE, MONOLOGUE_IDS[i], -1, -1, -1, 10);
+                    break;
+                }
+            }
+
+            Logger.LogInfo($"[Milestone] Fired notification at {milestone}%");
+        }
+        catch (System.Exception ex)
+        {
+            Logger.LogError($"[Milestone] Exception: {ex.Message}");
+        }
+    }
+
+    private static void UpdateInfectionHeartbeat(object player)
+    {
+        try
+        {
+            var pc = player as PlayerController;
+            if (pc == null) return;
+
+            bool criticalInfection = _customInfection >= INFECTION_HEARTBEAT_THRESHOLD;
+
+            if (criticalInfection && !_infectionHeartbeatPlaying)
+            {
+                // Only start it ourselves if the game isn't already playing it for low HP.
+                // If isLowHealth is true the game owns the sound — we don't touch it.
+                if (!pc.isLowHealth)
+                {
+                    EnsureAudioReflection();
+                    _audioPlaySFX?.Invoke(null, new object[] { "ui-heartbeat" });
+                }
+
+                _infectionHeartbeatPlaying = true;
+                Logger.LogInfo($"[SFX] Infection heartbeat started at {_customInfection:F1}%");
+            }
+            else if (!criticalInfection && _infectionHeartbeatPlaying)
+            {
+                StopInfectionHeartbeat(pc);
+            }
+        }
+        catch (System.Exception ex)
+        {
+            Logger.LogError($"[SFX] Exception in UpdateInfectionHeartbeat: {ex.Message}");
+        }
+    }
+
+    // Call this anywhere the heartbeat should stop (scene change, death, cure).
+    // Only sends StopSFX if the game itself isn't keeping it alive for low HP.
+    private static void StopInfectionHeartbeat(PlayerController pc)
+    {
+        if (!_infectionHeartbeatPlaying) return;
+        _infectionHeartbeatPlaying = false;
+
+        // If the player is currently low HP the game owns the heartbeat — leave it alone.
+        if (pc != null && pc.isLowHealth) return;
+
+        EnsureAudioReflection();
+        _audioStopSFX?.Invoke(null, new object[] { "ui-heartbeat" });
+        Logger.LogInfo("[SFX] Infection heartbeat stopped");
+    }
+
+    
+    // Set just before SetHealth(0) is called; cleared by the host patch after use.
+    internal static int _infectionKillPlayerIdx = -1;
+
     private static void KillPlayerFromInfection(object player)
     {
         try
         {
             var deathPosition = PlayerHelper.GetPosition(player);
-
-            PlayerHelper.SetHealth(player, 0f);
-            
-            // Prevent reviving - mark as permanently dead
             var pc = player as PlayerController;
-            if (pc != null)
-            {
-                pc.isPermadeath = true;
-                if (pc.reviveArea != null)
-                    pc.reviveArea.enabled = false;
-            }
+
+            // Clean up our heartbeat before the game's own death code runs
+            // (OnReviveTimeChanged will call StopSFX("ui-heartbeat") anyway,
+            // but stopping it here keeps state consistent).
+            StopInfectionHeartbeat(pc);
 
             if (NetworkHelper.IsServer())
             {
+                // ── HOST PATH ────────────────────────────────────────────────
+                // On the host we have StateAuthority over this player's
+                // PlayerPhotonNetwork, so we can write networked properties
+                // directly.  Set the flag so the ReviveTimer patch (below)
+                // immediately snaps the countdown to 0 the moment the game
+                // starts it, triggering the full networked permadeath sequence
+                // on every client.
+                if (pc != null)
+                    _infectionKillPlayerIdx = pc.network.GetIDX();
+
+                PlayerHelper.SetHealth(player, 0f);
+
+                // Give the game one frame to start the revive timer, then the
+                // InfectionReviveTimerPatch Postfix will snap it to 0.
+
                 bool spawnSuccess = CoreLibrary.EliteSpawnHelper.SpawnEliteAtPosition(deathPosition);
-            
+                Logger.LogInfo($"[KillPlayer] Host: infection kill sent, elite spawn={spawnSuccess}");
             }
             else
             {
-                Logger.LogInfo("[KillPlayer] Client detected death - server will spawn elite");
+                // ── CLIENT PATH ──────────────────────────────────────────────
+                // We cannot write [Networked] properties from a client.
+                // SetHealth sends RpcAddHealth to StateAuthority (host) which
+                // will bring HP to 0 and start the revive countdown on the
+                // host.  The host's InfectionReviveTimerPatch will NOT fire
+                // for us (it only knows about the host's own infection kill).
+                // The player will be downed and the revive timer will run its
+                // normal 90-second course before the game triggers permadeath
+                // automatically.  This is the best we can do without adding new
+                // [Networked] state or a custom RPC.
+                PlayerHelper.SetHealth(player, 0f);
+                Logger.LogInfo("[KillPlayer] Client: sent RpcAddHealth(0) to host, revive timer will expire normally");
             }
-
         }
         catch (System.Exception ex)
         {
@@ -742,7 +931,50 @@ public class Plugin : BaseUnityPlugin
     // -------------------------------------------------------------------------
 }
 
-// Patches PlayerNetwork.AddSubHealth — a plain MonoBehaviour method (not Fusion-woven).
+// ─────────────────────────────────────────────────────────────────────────────
+// HOST-ONLY: Intercept FixedUpdate on the player whose infection kill was
+// requested.  When the revive timer starts for that player, stop it immediately
+// and set reviveTimerSecond = 0 so OnReviveTimeChanged fires on every client,
+// triggering the full networked permadeath sequence (isPermadeath = true,
+// reviveArea disabled, items dropped, etc.).
+// ─────────────────────────────────────────────────────────────────────────────
+[HarmonyPatch(typeof(PlayerController), "FixedUpdate")]
+internal static class InfectionReviveTimerPatch
+{
+    [HarmonyPostfix]
+    public static void Postfix(PlayerController __instance)
+    {
+        try
+        {
+            // Only the server writes reviveTimerSecond
+            if (!NetworkGameManager.Instance || !NetworkGameManager.Instance.isServer) return;
+
+            int targetIdx = InfectionMod.Plugin._infectionKillPlayerIdx;
+            if (targetIdx < 0) return;
+
+            // Check this is the right player
+            if (__instance.network == null) return;
+            if (__instance.network.GetIDX() != targetIdx) return;
+
+            // Wait until the revive timer has actually started (player is downed)
+            if (!__instance.reviveTimer.isRunning) return;
+
+            // Snap timer to 0 — this writes reviveTimerSecond = 0 which
+            // fires OnReviveTimeChanged on all clients.
+            __instance.reviveTimer.StopDuration();
+            __instance.network.playerPhoton.reviveTimerSecond = 0;
+
+            // Clear the flag so we only do this once per infection kill
+            InfectionMod.Plugin._infectionKillPlayerIdx = -1;
+
+            Plugin.Logger.LogInfo($"[InfectionReviveTimer] Snapped reviveTimerSecond to 0 for player idx={targetIdx} — networked permadeath triggered");
+        }
+        catch (System.Exception ex)
+        {
+            Plugin.Logger.LogError($"[InfectionReviveTimer] Exception: {ex.Message}");
+        }
+    }
+}
 // Fires AFTER the guards inside AddSubHealth have already been evaluated, but BEFORE
 // the value is written to the network. The `value` parameter here is the ORIGINAL
 // pre-scaled float (negative = damage, positive = heal).
@@ -768,6 +1000,9 @@ internal static class AddSubHealthPatch
         // if invincibility would block the damage, don't count it as a hit.
         if (__instance.playerController == null) return;
         if (__instance.playerController.invincibleTimer.isRunning) return;
+
+        // Mirror the god mode guard — god mode blocks damage, so skip.
+        if (__instance.playerController.IsGod) return;
 
         // Mirror the dead check — don't add infection to an already-downed player
         // via direct damage (the passive infection tick handles downed state separately).
